@@ -203,6 +203,25 @@ class RobotClient:
             raw={"$AXIS_ACT": raw_axis, "E1_ON": raw_pwm},
         )
 
+    def read_var(self, name: str) -> str:
+        return self._osv.read(str(name))
+
+    def write_var(self, name: str, value) -> None:
+        # Try common method names depending on py_openshowvar version
+        n = str(name)
+        v = str(value)
+        if hasattr(self._osv, "write"):
+            self._osv.write(n, v)
+            return
+        if hasattr(self._osv, "set"):
+            self._osv.set(n, v)
+            return
+        if hasattr(self._osv, "write_var"):
+            self._osv.write_var(n, v)
+            return
+        raise AttributeError("py_openshowvar object has no supported write method")
+
+
 
 class CaptureWorker(QtCore.QThread):
     sig_frame = QtCore.pyqtSignal(dict)
@@ -239,6 +258,17 @@ class CaptureWorker(QtCore.QThread):
         self.det_every_n = 1
         self._det_frame_i = 0
         self._detector: Optional[PrintingDetector] = None
+
+        # Auto stop logic (optional)
+        self.stop_on_no_print = False
+        self.no_print_sec = 10.0
+        self.ov_var = "$OV_PRO"
+        self.ov_stop_value = 0
+        self.restore_ov = True
+
+        self._no_print_start_mono = None
+        self._ov_prev = None
+        self._ov_stopped = False
 
         self._stop = False
         self.recording = False
@@ -280,6 +310,64 @@ class CaptureWorker(QtCore.QThread):
         self.det_enabled = bool(enabled)
         self._detector = detector if self.det_enabled else None
         self.det_every_n = max(1, int(every_n))
+
+    def set_auto_stop(self, enabled: bool, no_print_sec: float, ov_var: str, ov_stop_value: int, restore_ov: bool):
+        self.stop_on_no_print = bool(enabled)
+        self.no_print_sec = float(no_print_sec)
+        self.ov_var = str(ov_var).strip() or "$OV_PRO"
+        self.ov_stop_value = int(ov_stop_value)
+        self.restore_ov = bool(restore_ov)
+
+        # reset state so changing settings does not carry old timers
+        self._no_print_start_mono = None
+        self._ov_prev = None
+        self._ov_stopped = False
+
+    def _maybe_auto_stop(self, det_state: Optional[dict]):
+        if not self.stop_on_no_print:
+            return
+        if self.robot is None:
+            return
+        if not det_state:
+            return
+
+        now_m = time.monotonic()
+        printing = bool(det_state.get("printing", False))
+
+        if printing:
+            self._no_print_start_mono = None
+            if self._ov_stopped:
+                if self.restore_ov and self._ov_prev is not None:
+                    try:
+                        self.robot.write_var(self.ov_var, int(self._ov_prev))
+                    except Exception:
+                        self.robot.write_var(self.ov_var, self._ov_prev)
+                    self.sig_status.emit(f"OV restored: {self.ov_var}={self._ov_prev}")
+                self._ov_stopped = False
+            return
+
+        # not printing
+        if self._no_print_start_mono is None:
+            self._no_print_start_mono = now_m
+            return
+
+        if self._ov_stopped:
+            return
+
+        if (now_m - float(self._no_print_start_mono)) >= float(self.no_print_sec):
+            # capture current OV before stopping, if possible
+            try:
+                raw = self.robot.read_var(self.ov_var)
+                prev = safe_float(raw)
+                if prev is not None:
+                    self._ov_prev = prev
+            except Exception:
+                pass
+
+            self.robot.write_var(self.ov_var, int(self.ov_stop_value))
+            self._ov_stopped = True
+            self.sig_status.emit(f"Auto stop: no print {float(self.no_print_sec):.1f}s, set {self.ov_var}={int(self.ov_stop_value)}")
+
 
     def start_recording(self, out_base: Path, session_name: str, duration_sec: float):
         out_dir = Path(out_base) / session_name
@@ -445,6 +533,13 @@ class CaptureWorker(QtCore.QThread):
                                     "off_count": int(st_det.off_count),
                                     "python": dbg.get("python", ""),
                                 }
+
+                                # optional safety behavior: stop robot if no printing for N seconds
+                                try:
+                                    self._maybe_auto_stop(det_state)
+                                except Exception as e:
+                                    self.sig_status.emit(f"Auto stop error: {e}")
+
                             except Exception as e:
                                 self.sig_status.emit(f"Detection runtime error: {e}")
                                 det_vis_bgr = None
@@ -491,6 +586,11 @@ class MainWindow(QtWidgets.QWidget):
         self.worker.sig_status.connect(self.on_status)
 
         self.worker.start()
+
+        # apply initial auto stop settings
+        if hasattr(self, "auto_stop_enable"):
+            self.on_auto_stop_changed()
+
 
         self._t0 = time.time()
         self._x: Deque[float] = deque(maxlen=600)
@@ -560,6 +660,29 @@ class MainWindow(QtWidgets.QWidget):
         self.det_every.setValue(1)
         self.det_every.valueChanged.connect(self.on_detection_changed)
 
+        # Auto stop option (requires robot connection)
+        self.auto_stop_enable = QtWidgets.QCheckBox("Auto stop if no printing")
+        self.auto_stop_enable.setChecked(False)
+        self.auto_stop_enable.stateChanged.connect(self.on_auto_stop_changed)
+
+        self.auto_stop_sec = QtWidgets.QSpinBox()
+        self.auto_stop_sec.setRange(1, 600)
+        self.auto_stop_sec.setValue(10)
+        self.auto_stop_sec.setSuffix(" s")
+        self.auto_stop_sec.valueChanged.connect(self.on_auto_stop_changed)
+
+        self.ov_var_edit = QtWidgets.QLineEdit("$OV_PRO")
+        self.ov_var_edit.textChanged.connect(self.on_auto_stop_changed)
+
+        self.ov_stop_value = QtWidgets.QSpinBox()
+        self.ov_stop_value.setRange(0, 100)
+        self.ov_stop_value.setValue(0)
+        self.ov_stop_value.valueChanged.connect(self.on_auto_stop_changed)
+
+        self.restore_ov_chk = QtWidgets.QCheckBox("Restore OV when printing resumes")
+        self.restore_ov_chk.setChecked(True)
+        self.restore_ov_chk.stateChanged.connect(self.on_auto_stop_changed)
+
         self.depth_min = QtWidgets.QSpinBox()
         self.depth_min.setRange(0, 10000)
         self.depth_min.setValue(10)
@@ -611,6 +734,11 @@ class MainWindow(QtWidgets.QWidget):
         form.addRow(self.det_enable)
         form.addRow("Model:", self.det_model)
         form.addRow("Infer every N frames:", self.det_every)
+        form.addRow(self.auto_stop_enable)
+        form.addRow("No print timeout:", self.auto_stop_sec)
+        form.addRow("OV variable:", self.ov_var_edit)
+        form.addRow("OV stop value:", self.ov_stop_value)
+        form.addRow(self.restore_ov_chk)
         form.addRow("Depth min:", self.depth_min)
         form.addRow("Depth max:", self.depth_max)
         form.addRow("Crop x:", self.crop_x)
@@ -692,6 +820,24 @@ class MainWindow(QtWidgets.QWidget):
                     self.det_enable.setChecked(False)
 
         self.worker.set_detection(enabled, detector, every_n)
+
+    def on_auto_stop_changed(self):
+        if not hasattr(self, "auto_stop_enable"):
+            return
+        enabled = bool(self.auto_stop_enable.isChecked())
+        sec = float(self.auto_stop_sec.value())
+        ov_var = str(self.ov_var_edit.text()).strip() or "$OV_PRO"
+        ov_stop = int(self.ov_stop_value.value())
+        restore = bool(self.restore_ov_chk.isChecked())
+
+        try:
+            self.worker.set_auto_stop(enabled, sec, ov_var, ov_stop, restore)
+            if enabled:
+                self.on_status(f"Auto stop armed: no print {sec:.0f}s -> {ov_var}={ov_stop}")
+            else:
+                self.on_status("Auto stop disabled")
+        except Exception as e:
+            self.on_status(f"Auto stop config error: {e}")
 
     def toggle_record(self):
         if self.btn_record.isChecked():

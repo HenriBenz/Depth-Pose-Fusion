@@ -1,387 +1,292 @@
 #!/usr/bin/env python3
 # printing_detection.py
+#
+# Drop-in detector module for ui_recorder_v.py
+# Provides: PrintingDetector.update(frame_bgr) -> (vis_bgr, state, debug)
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Any
+from __future__ import annotations
+
 import time
-import sys
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple, Any
 
-import numpy as np
 import cv2
-
-YOLO_IMPORT_ERROR = None
-try:
-    from ultralytics import YOLO
-except Exception as e:
-    YOLO = None
-    YOLO_IMPORT_ERROR = e
+import numpy as np
+from ultralytics import YOLO
 
 
-COLORS_BGR = {
-    "nozzle": (202, 250, 2),        # #02FACA
-    "old_deposit": (89, 5, 253),    # #FD0559
-    "new_deposit": (32, 168, 156),  # #9CA820
-}
-
-NEW_DEPOSIT_HL_BGR = (0, 252, 199)  # #C7FC00
+# -----------------------------
+# Small helpers
+# -----------------------------
+def clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(int(v), int(hi)))
 
 
+def crop_square(cx: int, cy: int, size: int, W: int, H: int) -> Tuple[int, int, int, int]:
+    half = int(size) // 2
+    x1 = clamp(cx - half, 0, W - 1)
+    y1 = clamp(cy - half, 0, H - 1)
+    x2 = clamp(cx + half, 0, W - 1)
+    y2 = clamp(cy + half, 0, H - 1)
+    return int(x1), int(y1), int(x2), int(y2)
+
+
+def count_mask_pixels(mask_u8: np.ndarray, box_xyxy: Tuple[int, int, int, int]) -> int:
+    x1, y1, x2, y2 = box_xyxy
+    if x2 <= x1 or y2 <= y1:
+        return 0
+    # mask is 0/1
+    return int(mask_u8[y1:y2, x1:x2].sum())
+
+
+def safe_put_text(img: np.ndarray, text: str, org: Tuple[int, int], scale: float = 0.7, thickness: int = 2) -> None:
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thickness + 3, cv2.LINE_AA)
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+
+def class_color(name: str) -> Tuple[int, int, int]:
+    # deterministic color from class name
+    h = abs(hash(name)) % (256 * 256 * 256)
+    b = (h) & 255
+    g = (h >> 8) & 255
+    r = (h >> 16) & 255
+    b = max(int(b), 60)
+    g = max(int(g), 60)
+    r = max(int(r), 60)
+    return (b, g, r)  # BGR
+
+
+def overlay_masks(frame_bgr: np.ndarray, masks_dict: Dict[str, np.ndarray], classes, alpha: float = 0.6) -> np.ndarray:
+    overlay = frame_bgr.copy()
+    for cname in classes:
+        m = masks_dict.get(cname, None)
+        if m is None:
+            continue
+        overlay[m == 1] = class_color(cname)
+    return cv2.addWeighted(overlay, float(alpha), frame_bgr, 1.0 - float(alpha), 0.0)
+
+
+def get_best_box_of_class(boxes, names: Dict[int, str], class_name: str):
+    if boxes is None or len(boxes) == 0:
+        return None
+    cls = boxes.cls.cpu().numpy().astype(int)
+    confs = boxes.conf.cpu().numpy()
+    xyxy = boxes.xyxy.cpu().numpy()
+
+    best = None
+    for i in range(len(cls)):
+        cname = names[int(cls[i])]
+        if cname != class_name:
+            continue
+        c = float(confs[i])
+        x1, y1, x2, y2 = xyxy[i]
+        cx = int((x1 + x2) / 2)
+        cy = int((y1 + y2) / 2)
+        cand = (c, cx, cy, (int(x1), int(y1), int(x2), int(y2)))
+        if best is None or cand[0] > best[0]:
+            best = cand
+    return best
+
+
+def build_class_masks(res, names: Dict[int, str], H: int, W: int) -> Dict[str, np.ndarray]:
+    masks_out: Dict[str, np.ndarray] = {}
+    if res.masks is None or res.masks.data is None:
+        return masks_out
+    if res.boxes is None or len(res.boxes) != len(res.masks.data):
+        return masks_out
+
+    mdata = res.masks.data.cpu().numpy()  # (n,h,w) float
+    mcls = res.boxes.cls.cpu().numpy().astype(int)
+
+    for i in range(len(mdata)):
+        cname = names[int(mcls[i])]
+        m = (mdata[i] > 0.5).astype(np.uint8)
+
+        if m.shape[0] != H or m.shape[1] != W:
+            m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+
+        if cname not in masks_out:
+            masks_out[cname] = m
+        else:
+            masks_out[cname] = np.maximum(masks_out[cname], m)
+
+    return masks_out
+
+
+# -----------------------------
+# Public API
+# -----------------------------
 @dataclass
-class DetectionState:
+class PrintingState:
     printing: bool
     nozzle_conf: float
-    new_area_roi_px: int
     new_area_roi_pct: float
     overlap_tip: float
     on_count: int
     off_count: int
 
 
-def overlay_masks_fixed(frame_bgr: np.ndarray, masks_dict: Dict[str, np.ndarray], classes: List[str], alpha: float = 0.6) -> np.ndarray:
-    overlay = frame_bgr.copy()
-    for cname in classes:
-        m = masks_dict.get(cname, None)
-        if m is None:
-            continue
-        color = COLORS_BGR.get(cname, (180, 180, 180))
-        overlay[m > 0] = color
-    return cv2.addWeighted(overlay, alpha, frame_bgr, 1.0 - alpha, 0)
-
-
-def draw_legend(img_bgr: np.ndarray, items: List[str], x: int = 20, y: int = 150) -> None:
-    pad = 10
-    sw = 22
-    sh = 14
-    line_h = 22
-
-    w = 220
-    h = pad * 2 + line_h * len(items)
-
-    panel = img_bgr.copy()
-    cv2.rectangle(panel, (x, y), (x + w, y + h), (0, 0, 0), -1)
-    img_bgr[:] = cv2.addWeighted(panel, 0.35, img_bgr, 0.65, 0)
-
-    for i, name in enumerate(items):
-        yy = y + pad + i * line_h
-        color = COLORS_BGR.get(name, (180, 180, 180))
-        cv2.rectangle(img_bgr, (x + pad, yy), (x + pad + sw, yy + sh), color, -1)
-        cv2.rectangle(img_bgr, (x + pad, yy), (x + pad + sw, yy + sh), (255, 255, 255), 1)
-        cv2.putText(
-            img_bgr,
-            name,
-            (x + pad + sw + 10, yy + sh - 2),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA
-        )
-
-
-def draw_mask_edges(img_bgr: np.ndarray, mask_u8: np.ndarray, color: Tuple[int, int, int] = (255, 255, 255), thickness: int = 2) -> None:
-    mu8 = (mask_u8 > 0).astype(np.uint8) * 255
-    cnts, _ = cv2.findContours(mu8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if cnts:
-        cv2.drawContours(img_bgr, cnts, -1, color, thickness)
-
-
-def _largest_contour_bbox(mask_u8: np.ndarray) -> Optional[Tuple[int, int, int, int]]:
-    cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not cnts:
-        return None
-    c = max(cnts, key=cv2.contourArea)
-    x, y, w, h = cv2.boundingRect(c)
-    return x, y, w, h
-
-
-def _clamp_roi(x1: int, y1: int, x2: int, y2: int, w: int, h: int) -> Tuple[int, int, int, int]:
-    x1 = max(0, min(x1, w - 1))
-    y1 = max(0, min(y1, h - 1))
-    x2 = max(0, min(x2, w - 1))
-    y2 = max(0, min(y2, h - 1))
-    if x2 <= x1:
-        x2 = min(w - 1, x1 + 1)
-    if y2 <= y1:
-        y2 = min(h - 1, y1 + 1)
-    return x1, y1, x2, y2
-
-
 class PrintingDetector:
+    """
+    UI friendly detector wrapper.
+
+    Call update(frame_bgr) where frame_bgr is a numpy uint8 BGR image.
+    Returns:
+      vis_bgr: BGR image with mask overlay + ROI boxes + labels
+      state: PrintingState
+      debug: dict
+    """
+
     def __init__(
         self,
         model_path: str,
-        nozzle_class_ids: Optional[List[int]] = None,
-        new_deposit_class_ids: Optional[List[int]] = None,
-        old_deposit_class_ids: Optional[List[int]] = None,
-        alpha: float = 0.6,
-        roi_half_size_px: int = 110,
-        tip_radius_px: int = 45,
-        overlap_on_thresh: float = 0.05,
-        overlap_off_thresh: float = 0.02,
-        roi_area_on_pct: float = 0.010,
-        roi_area_off_pct: float = 0.004,
+        conf: float = 0.35,
+        class_nozzle: str = "nozzle",
+        class_new: str = "new_deposit",
+        overlay_classes = ("nozzle", "new_deposit", "old_deposit"),
+        mask_alpha: float = 0.60,
+        roi_size: int = 220,
+        tip_zone_w: int = 90,
+        tip_zone_h: int = 70,
+        tip_y_offset: int = 0,
+        a_min_px: int = 900,
+        o_min: float = 0.08,
         k_on: int = 3,
-        k_off: int = 6,
-        min_on_seconds: float = 0.4,
-        conf_thresh: float = 0.25,
-        iou_thresh: float = 0.6,
-        img_size: int = 640,
-        verbose: bool = False,
+        k_off: int = 10,
+        nozzle_hold_sec: float = 0.5,
     ):
-        if YOLO is None:
-            raise RuntimeError(
-                "Ultralytics import failed.\n"
-                f"python: {sys.executable}\n"
-                f"error: {YOLO_IMPORT_ERROR}\n"
-                "Fix: install in this env: pip install ultralytics"
-            )
+        self.model = YOLO(str(model_path))
+        self.names = self.model.names
 
-        self.model = YOLO(model_path)
-        self.model_path = model_path
+        self.conf = float(conf)
 
-        self.nozzle_class_ids = nozzle_class_ids
-        self.new_deposit_class_ids = new_deposit_class_ids
-        self.old_deposit_class_ids = old_deposit_class_ids
+        self.CLASS_NOZZLE = str(class_nozzle)
+        self.CLASS_NEW = str(class_new)
+        self.OVERLAY_CLASSES = list(overlay_classes)
 
-        self.alpha = float(alpha)
-        self.roi_half = int(roi_half_size_px)
-        self.tip_radius = int(tip_radius_px)
+        self.MASK_ALPHA = float(mask_alpha)
 
-        self.overlap_on_thresh = float(overlap_on_thresh)
-        self.overlap_off_thresh = float(overlap_off_thresh)
+        self.ROI_SIZE = int(roi_size)
+        self.TIP_ZONE_W = int(tip_zone_w)
+        self.TIP_ZONE_H = int(tip_zone_h)
+        self.TIP_Y_OFFSET = int(tip_y_offset)
 
-        self.roi_area_on_pct = float(roi_area_on_pct)
-        self.roi_area_off_pct = float(roi_area_off_pct)
+        self.A_MIN = int(a_min_px)
+        self.O_MIN = float(o_min)
+        self.K_ON = int(k_on)
+        self.K_OFF = int(k_off)
+        self.NOZZLE_HOLD_SEC = float(nozzle_hold_sec)
 
-        self.k_on = int(k_on)
-        self.k_off = int(k_off)
-        self.min_on_seconds = float(min_on_seconds)
+        # hysteresis
+        self.printing = False
+        self.on_count = 0
+        self.off_count = 0
 
-        self.conf_thresh = float(conf_thresh)
-        self.iou_thresh = float(iou_thresh)
-        self.img_size = int(img_size)
-        self.verbose = bool(verbose)
+        # nozzle hold
+        self.last_nozzle_time = 0.0
+        self.last_nozzle = None
 
-        self._on_count = 0
-        self._off_count = 0
-        self._printing = False
-        self._on_since: Optional[float] = None
+        self._last_vis = None
+        self._last_state = PrintingState(False, 0.0, 0.0, 0.0, 0, 0)
 
-        self._names = getattr(self.model, "names", None)
+    def update(self, frame_bgr: np.ndarray):
+        t0 = time.time()
 
-    def _resolve_ids_by_name(self) -> Tuple[List[int], List[int], List[int]]:
-        nozzle_ids: List[int] = []
-        new_ids: List[int] = []
-        old_ids: List[int] = []
-
-        if isinstance(self._names, dict):
-            for cid, nm in self._names.items():
-                n = str(nm).lower()
-                if "nozzle" in n or "extruder" in n or "tip" in n:
-                    nozzle_ids.append(int(cid))
-                if "old" in n:
-                    old_ids.append(int(cid))
-                if "new" in n or "deposit" in n or "layer" in n or "material" in n or "print" in n:
-                    new_ids.append(int(cid))
-
-        if not nozzle_ids:
-            nozzle_ids = [1]
-        if not new_ids:
-            new_ids = [0]
-        return nozzle_ids, new_ids, old_ids
-
-    def _get_class_ids(self) -> Tuple[List[int], List[int], List[int]]:
-        if self.nozzle_class_ids is not None or self.new_deposit_class_ids is not None or self.old_deposit_class_ids is not None:
-            nozzle_ids = self.nozzle_class_ids if self.nozzle_class_ids is not None else []
-            new_ids = self.new_deposit_class_ids if self.new_deposit_class_ids is not None else []
-            old_ids = self.old_deposit_class_ids if self.old_deposit_class_ids is not None else []
-            n2, new2, old2 = self._resolve_ids_by_name()
-            if not nozzle_ids:
-                nozzle_ids = n2
-            if not new_ids:
-                new_ids = new2
-            if not old_ids:
-                old_ids = old2
-            return nozzle_ids, new_ids, old_ids
-
-        return self._resolve_ids_by_name()
-
-    def _closest_component_area_in_roi(
-        self,
-        bin_mask_u8: np.ndarray,
-        tip_xy: Tuple[int, int],
-        roi: Tuple[int, int, int, int]
-    ) -> Tuple[int, float]:
-        x1, y1, x2, y2 = roi
-        m_roi = bin_mask_u8[y1:y2, x1:x2]
-        if m_roi.size == 0:
-            return 0, 0.0
-
-        num, _, stats, centroids = cv2.connectedComponentsWithStats((m_roi > 0).astype(np.uint8), connectivity=8)
-        if num <= 1:
-            return 0, 0.0
-
-        tip_cx, tip_cy = tip_xy
-        tip_rx = tip_cx - x1
-        tip_ry = tip_cy - y1
-
-        best_d2 = 1e18
-        best_area = 0
-        for i in range(1, num):
-            area = int(stats[i, cv2.CC_STAT_AREA])
-            cx, cy = centroids[i]
-            d2 = (cx - tip_rx) ** 2 + (cy - tip_ry) ** 2
-            if d2 < best_d2:
-                best_d2 = d2
-                best_area = area
-
-        roi_area = max(1, int((x2 - x1) * (y2 - y1)))
-        return best_area, float(best_area) / float(roi_area)
-
-    def update(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, DetectionState, Dict[str, Any]]:
         if frame_bgr is None:
-            raise ValueError("frame_bgr is None")
+            return None, self._last_state, {"python": "frame=None"}
 
-        h, w = frame_bgr.shape[:2]
-        nozzle_ids, new_ids, old_ids = self._get_class_ids()
+        H, W = frame_bgr.shape[:2]
+        if H < 2 or W < 2:
+            return frame_bgr, self._last_state, {"python": "frame too small"}
 
-        masks_dict = {
-            "nozzle": np.zeros((h, w), dtype=np.uint8),
-            "new_deposit": np.zeros((h, w), dtype=np.uint8),
-            "old_deposit": np.zeros((h, w), dtype=np.uint8),
-        }
+        res = self.model.predict(frame_bgr, conf=self.conf, verbose=False)[0]
+
+        nozzle = get_best_box_of_class(res.boxes, self.names, self.CLASS_NOZZLE)
+        masks = build_class_masks(res, self.names, H, W)
+        new_mask = masks.get(self.CLASS_NEW, np.zeros((H, W), dtype=np.uint8))
+
+        vis = overlay_masks(frame_bgr, masks, self.OVERLAY_CLASSES, alpha=self.MASK_ALPHA)
+
+        now = time.time()
+        if nozzle is not None:
+            self.last_nozzle = nozzle
+            self.last_nozzle_time = now
+
+        use_nozzle = None
+        if self.last_nozzle is not None and (now - self.last_nozzle_time) <= self.NOZZLE_HOLD_SEC:
+            use_nozzle = self.last_nozzle
+
         nozzle_conf = 0.0
+        nx = ny = -1
+        new_area_roi = 0
+        overlap_tip = 0.0
+        new_area_roi_pct = 0.0
 
-        res = self.model.predict(
-            source=frame_bgr,
-            conf=self.conf_thresh,
-            iou=self.iou_thresh,
-            imgsz=self.img_size,
-            verbose=self.verbose
-        )
+        if use_nozzle is not None:
+            nozzle_conf, nx, ny, nbbox = use_nozzle
 
-        if res and len(res) > 0:
-            r0 = res[0]
-            boxes = getattr(r0, "boxes", None)
-            masks = getattr(r0, "masks", None)
+            roi_box = crop_square(nx, ny, self.ROI_SIZE, W, H)
 
-            if boxes is not None and masks is not None and getattr(masks, "data", None) is not None:
-                cls = boxes.cls.detach().cpu().numpy().astype(int) if boxes.cls is not None else None
-                conf = boxes.conf.detach().cpu().numpy().astype(float) if boxes.conf is not None else None
-                mdata = masks.data.detach().cpu().numpy()
+            tx1 = clamp(nx - self.TIP_ZONE_W // 2, 0, W - 1)
+            tx2 = clamp(nx + self.TIP_ZONE_W // 2, 0, W - 1)
+            ty1 = clamp(ny + self.TIP_Y_OFFSET, 0, H - 1)
+            ty2 = clamp(ny + self.TIP_Y_OFFSET + self.TIP_ZONE_H, 0, H - 1)
+            tip_box = (int(tx1), int(ty1), int(tx2), int(ty2))
 
-                for i in range(mdata.shape[0]):
-                    cid = int(cls[i]) if cls is not None else -1
-                    mi = (mdata[i] > 0.5).astype(np.uint8) * 255
+            new_area_roi = count_mask_pixels(new_mask, roi_box)
+            roi_area = max(1, (roi_box[2] - roi_box[0]) * (roi_box[3] - roi_box[1]))
+            new_area_roi_pct = float(new_area_roi) / float(roi_area)
 
-                    if cid in nozzle_ids:
-                        masks_dict["nozzle"] = cv2.bitwise_or(masks_dict["nozzle"], mi)
-                        if conf is not None:
-                            nozzle_conf = max(nozzle_conf, float(conf[i]))
+            tip_area = max(1, (tip_box[2] - tip_box[0]) * (tip_box[3] - tip_box[1]))
+            tip_new = count_mask_pixels(new_mask, tip_box)
+            overlap_tip = float(tip_new) / float(tip_area)
 
-                    if cid in new_ids:
-                        masks_dict["new_deposit"] = cv2.bitwise_or(masks_dict["new_deposit"], mi)
+            is_printing_now = (new_area_roi >= self.A_MIN) and (overlap_tip >= self.O_MIN)
 
-                    if cid in old_ids:
-                        masks_dict["old_deposit"] = cv2.bitwise_or(masks_dict["old_deposit"], mi)
+            if is_printing_now:
+                self.on_count += 1
+                self.off_count = 0
+            else:
+                self.off_count += 1
+                self.on_count = 0
 
-        nozzle_bbox = _largest_contour_bbox(masks_dict["nozzle"])
+            if (not self.printing) and self.on_count >= self.K_ON:
+                self.printing = True
+            if self.printing and self.off_count >= self.K_OFF:
+                self.printing = False
 
-        tip_cx = w // 2
-        tip_cy = h // 2
-        if nozzle_bbox is not None:
-            x, y, bw, bh = nozzle_bbox
-            tip_cx = int(x + bw / 2)
-            tip_cy = int(y + bh)
+            # draw helpers
+            cv2.rectangle(vis, (roi_box[0], roi_box[1]), (roi_box[2], roi_box[3]), (0, 255, 255), 2)
+            cv2.rectangle(vis, (tip_box[0], tip_box[1]), (tip_box[2], tip_box[3]), (255, 255, 0), 2)
 
-        x1, y1, x2, y2 = _clamp_roi(tip_cx - self.roi_half, tip_cy - self.roi_half, tip_cx + self.roi_half, tip_cy + self.roi_half, w, h)
-        roi = (x1, y1, x2, y2)
+            x1, y1, x2, y2 = nbbox
+            cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 255), 2)
+            cv2.circle(vis, (nx, ny), 5, (0, 255, 255), -1)
 
-        new_area_px, new_area_pct = self._closest_component_area_in_roi(masks_dict["new_deposit"], (tip_cx, tip_cy), roi)
+        else:
+            # no nozzle, decay to NOT PRINTING with hysteresis
+            self.off_count += 1
+            self.on_count = 0
+            if self.printing and self.off_count >= self.K_OFF:
+                self.printing = False
 
-        tip_mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.circle(tip_mask, (tip_cx, tip_cy), self.tip_radius, 255, -1)
+        # label
+        state_text = "PRINTING" if self.printing else "NOT PRINTING"
+        safe_put_text(vis, state_text, (15, 32), scale=0.95, thickness=2)
+        safe_put_text(vis, f"roi_new={new_area_roi_pct*100.0:.2f}%  tip_ov={overlap_tip:.3f}", (15, 60), scale=0.65, thickness=2)
+        safe_put_text(vis, f"nozzle={nozzle_conf:.2f}  on={self.on_count} off={self.off_count}", (15, 84), scale=0.65, thickness=2)
 
-        overlap = cv2.bitwise_and(masks_dict["new_deposit"], tip_mask)
-        tip_area = max(1, int(cv2.countNonZero(tip_mask)))
-        overlap_tip = float(cv2.countNonZero(overlap)) / float(tip_area)
-
-        on_signal = (new_area_pct >= self.roi_area_on_pct) and (overlap_tip >= self.overlap_on_thresh)
-        off_signal = (new_area_pct <= self.roi_area_off_pct) or (overlap_tip <= self.overlap_off_thresh)
-
-        if on_signal:
-            self._on_count += 1
-            self._off_count = max(0, self._off_count - 1)
-        elif off_signal:
-            self._off_count += 1
-            self._on_count = max(0, self._on_count - 1)
-
-        now = time.monotonic()
-
-        if (not self._printing) and (self._on_count >= self.k_on):
-            self._printing = True
-            self._off_count = 0
-            self._on_since = now
-
-        if self._printing:
-            on_age = 0.0 if self._on_since is None else (now - self._on_since)
-            if on_age >= self.min_on_seconds and self._off_count >= self.k_off:
-                self._printing = False
-                self._on_count = 0
-                self._on_since = None
-
-        vis = frame_bgr.copy()
-        overlay_classes = ["new_deposit", "old_deposit", "nozzle"]
-        vis = overlay_masks_fixed(vis, masks_dict, overlay_classes, alpha=self.alpha)
-
-        for cname in overlay_classes:
-            m = masks_dict.get(cname, None)
-            if m is not None:
-                draw_mask_edges(vis, m, color=(255, 255, 255), thickness=2)
-
-        cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 255, 255), 2)
-        cv2.circle(vis, (tip_cx, tip_cy), self.tip_radius, (255, 255, 255), 2)
-
-        draw_legend(vis, ["nozzle", "new_deposit", "old_deposit"], x=20, y=150)
-
-        status = "PRINTING" if self._printing else "NOT PRINTING"
-        label_bg = NEW_DEPOSIT_HL_BGR if self._printing else (0, 0, 0)
-
-        x0, y0 = 12, 10
-        w_box, h_box = 420, 64
-        panel = vis.copy()
-        cv2.rectangle(panel, (x0, y0), (x0 + w_box, y0 + h_box), label_bg, -1)
-        vis[:] = cv2.addWeighted(panel, 0.55, vis, 0.45, 0)
-
-        txt_color = (0, 0, 0) if self._printing else (255, 255, 255)
-        cv2.putText(vis, status, (x0 + 10, y0 + 28), cv2.FONT_HERSHEY_SIMPLEX, 0.95, txt_color, 2, cv2.LINE_AA)
-        cv2.putText(
-            vis,
-            f"roi={new_area_pct*100:.2f}% ov={overlap_tip:.3f} noz={nozzle_conf:.2f} on={self._on_count} off={self._off_count}",
-            (x0 + 10, y0 + 52),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            txt_color,
-            2,
-            cv2.LINE_AA
-        )
-
-        st = DetectionState(
-            printing=bool(self._printing),
+        state = PrintingState(
+            printing=bool(self.printing),
             nozzle_conf=float(nozzle_conf),
-            new_area_roi_px=int(new_area_px),
-            new_area_roi_pct=float(new_area_pct),
+            new_area_roi_pct=float(new_area_roi_pct),
             overlap_tip=float(overlap_tip),
-            on_count=int(self._on_count),
-            off_count=int(self._off_count),
+            on_count=int(self.on_count),
+            off_count=int(self.off_count),
         )
 
-        dbg: Dict[str, Any] = {
-            "tip": (tip_cx, tip_cy),
-            "roi": (x1, y1, x2, y2),
-            "python": sys.executable,
-            "nozzle_ids": nozzle_ids,
-            "new_ids": new_ids,
-            "old_ids": old_ids,
-        }
-        return vis, st, dbg
+        dbg = {"python": f"dt={(time.time()-t0)*1000.0:.1f}ms"}
+
+        self._last_vis = vis
+        self._last_state = state
+        return vis, state, dbg
