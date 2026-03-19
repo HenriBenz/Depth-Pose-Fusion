@@ -67,6 +67,25 @@ def parse_pwm(raw: str) -> Optional[float]:
     return safe_float(raw)
 
 
+
+def _to_text(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", errors="ignore").replace("\x00", "").strip()
+    return str(v).strip()
+
+
+def _parse_num_from_struct(s: str, key: str) -> Optional[float]:
+    """Parse 'A1 12.3' style tokens from KUKA $AXIS_ACT / structs."""
+    try:
+        m = re.search(rf"\b{re.escape(key)}\s+(-?\d+(?:\.\d+)?)", str(s))
+        if not m:
+            return None
+        return float(m.group(1))
+    except Exception:
+        return None
+
 def frame_id_str(i: int) -> str:
     return f"{i:06d}"
 
@@ -175,22 +194,104 @@ class RobotSample:
 
 
 class RobotClient:
-    def __init__(self, ip: str, port: int = 7000):
+    """KUKA reader (OpenShowVar). Tries to read E1_ON if available.
+    If E1_ON is not available, derives a binary ON/OFF signal from E1 velocity
+    (same logic style as ui_recorder.py).
+    """
+
+    def __init__(self, ip: str, port: int = 7000, e1_vel_threshold: float = 5.0):
         self.ip = ip
         self.port = port
+        self.e1_vel_threshold = float(e1_vel_threshold)
+
         self._osv = openshowvar(self.ip, self.port)
+
+        self._last_e1: Optional[float] = None
+        self._last_t: Optional[float] = None
+
+    def _e1_on_from_velocity(self, t: float, e1: Optional[float]) -> Optional[float]:
+        if e1 is None:
+            return None
+        if self._last_e1 is None or self._last_t is None:
+            self._last_e1 = float(e1)
+            self._last_t = float(t)
+            return None
+        dt = float(t) - float(self._last_t)
+        if dt <= 1e-6:
+            return None
+        vel = abs((float(e1) - float(self._last_e1)) / dt)
+        self._last_e1 = float(e1)
+        self._last_t = float(t)
+        return 1.0 if vel >= self.e1_vel_threshold else 0.0
 
     def poll(self) -> Optional[RobotSample]:
         t = time.time()
-        raw_axis = self._osv.read("$AXIS_ACT")
-        raw_pwm = self._osv.read("E1_ON")
-        axis = parse_axis_act(raw_axis)
-        pwm = parse_pwm(raw_pwm)
+
+        try:
+            raw_axis = _to_text(self._osv.read("$AXIS_ACT"))
+        except Exception:
+            raw_axis = ""
+        if not raw_axis:
+            return None
+
+        # axis A1..A6 + E1 if present
+        a1 = _parse_num_from_struct(raw_axis, "A1")
+        a2 = _parse_num_from_struct(raw_axis, "A2")
+        a3 = _parse_num_from_struct(raw_axis, "A3")
+        a4 = _parse_num_from_struct(raw_axis, "A4")
+        a5 = _parse_num_from_struct(raw_axis, "A5")
+        a6 = _parse_num_from_struct(raw_axis, "A6")
+        e1 = _parse_num_from_struct(raw_axis, "E1")
+
+        axis = None
+        if all(v is not None for v in (a1, a2, a3, a4, a5, a6)):
+            axis = np.array([a1, a2, a3, a4, a5, a6], dtype=np.float32)
+        else:
+            # fallback: old parser (first 6 numeric tokens)
+            axis = parse_axis_act(raw_axis)
+
+        # Prefer direct E1_ON variable if it exists
+        raw_e1_on = ""
+        pwm = None
+        try:
+            raw_e1_on = _to_text(self._osv.read("E1_ON"))
+            pwm = parse_pwm(raw_e1_on)
+        except Exception:
+            raw_e1_on = ""
+            pwm = None
+
+        # If not available, derive from E1 velocity
+        if pwm is None:
+            pwm = self._e1_on_from_velocity(t, e1)
+
+        # Optional extra vars for debugging/logging (no hard dependency)
+        raw_e_rpm = ""
+        raw_extr_mod = ""
+        raw_ov = ""
+        try:
+            raw_e_rpm = _to_text(self._osv.read("E_RPM"))
+        except Exception:
+            pass
+        try:
+            raw_extr_mod = _to_text(self._osv.read("EXTR_MOD"))
+        except Exception:
+            pass
+        try:
+            raw_ov = _to_text(self._osv.read("$OV_PRO"))
+        except Exception:
+            pass
+
         return RobotSample(
             t_wall=t,
             axis=axis,
             pwm=pwm,
-            raw={"$AXIS_ACT": raw_axis, "E1_ON": raw_pwm},
+            raw={
+                "$AXIS_ACT": raw_axis,
+                "E1_ON": raw_e1_on,
+                "E_RPM": raw_e_rpm,
+                "EXTR_MOD": raw_extr_mod,
+                "$OV_PRO": raw_ov,
+            },
         )
 
 
@@ -206,7 +307,7 @@ class CaptureWorker(QtCore.QThread):
         fps: int = 30,
         no_rgb: bool = False,
         rotate_deg: int = 180,
-        robot_ip: str = "172.31.1.147",
+        robot_ip: str = "10.1.0.121",
         port: int = 7000,
     ):
         super().__init__()
@@ -469,46 +570,96 @@ class CaptureWorker(QtCore.QThread):
             pass
 
 
-class MainWindow(QtWidgets.QWidget):
+class _ImageLabelMixin:
+    def _show_bgr_on_label(self, bgr: np.ndarray, label: QtWidgets.QLabel):
+        if bgr is None or label is None:
+            return
+        h, w = bgr.shape[:2]
+        if h <= 0 or w <= 0:
+            return
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        qimg = QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+        pix = QtGui.QPixmap.fromImage(qimg)
+        label.setPixmap(
+            pix.scaled(label.width(), label.height(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+        )
+
+
+class VisualWindow(QtWidgets.QWidget, _ImageLabelMixin):
+    sig_close = QtCore.pyqtSignal()
+    """Window 1: visual only (camera + overlays)."""
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Depth-Pose Logger UI")
+        self.setWindowTitle("Visual")
         self.resize(1700, 930)
+        self.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
 
-        self.worker = CaptureWorker()
-        self.worker.sig_frame.connect(self.on_frame)
-        self.worker.sig_robot.connect(self.on_robot)
-        self.worker.sig_status.connect(self.on_status)
-
-        self.worker.start()
-
-        self._t0 = time.time()
-        self._last_printing: Optional[bool] = None
-        self._no_print_since: Optional[float] = None  # wall time when NOT PRINTING started
-        self._x: Deque[float] = deque(maxlen=600)
-        self._y_axes: Deque[np.ndarray] = deque(maxlen=600)
-        self._y_pwm: Deque[float] = deque(maxlen=600)
+        self._no_print_since: Optional[float] = None
 
         layout = QtWidgets.QGridLayout(self)
 
-        # ------------------------------------------------------------
-        # Camera views layout (matches: 1 big left, 2/3/4 stacked right)
-        # 1 = segmentation/decision, 2 = RGB, 3 = RGBD (depth), 4 = crop RGB (ROI)
-        # ------------------------------------------------------------
-        self.rgb_full_label = QtWidgets.QLabel()   # (2) RGB
-        self.depth_label = QtWidgets.QLabel()      # (3) Depth preview
-        self.rgb_crop_label = QtWidgets.QLabel()   # (4) ROI crop
-        self.det_label = QtWidgets.QLabel()        # (1) Segmentation + decision
+        # camera labels
+        self.rgb_full_label = QtWidgets.QLabel()
+        self.depth_label = QtWidgets.QLabel()
+        self.rgb_crop_label = QtWidgets.QLabel()
+        self.det_label = QtWidgets.QLabel()
 
         for lab in [self.rgb_full_label, self.depth_label, self.rgb_crop_label, self.det_label]:
             lab.setAlignment(QtCore.Qt.AlignCenter)
             lab.setStyleSheet("background:#0b0b0b; border:1px solid #2a2a2a;")
 
-        # make right column compact, left panel dominant
         self.rgb_full_label.setMinimumSize(360, 210)
         self.depth_label.setMinimumSize(360, 210)
         self.rgb_crop_label.setMinimumSize(360, 210)
         self.det_label.setMinimumSize(980, 650)
+
+        # top status row
+        self.print_pill = QtWidgets.QLabel("PRINTING: -")
+        self.print_pill.setAlignment(QtCore.Qt.AlignCenter)
+        self.print_pill.setStyleSheet("padding:10px; border-radius:12px; background:#1a1a1a; color:#eaeaea; font-size:18px; font-weight:600;")
+
+        self.det_reason = QtWidgets.QLabel("Reason: -")
+        self.det_reason.setStyleSheet("color:#cfcfcf;")
+        self.det_reason.setWordWrap(True)
+
+        self.det_conf_lbl = QtWidgets.QLabel("Confidence: -")
+        self.det_conf_lbl.setStyleSheet("color:#cfcfcf;")
+
+        self.det_timer_lbl = QtWidgets.QLabel("No-print timer: -")
+        self.det_timer_lbl.setStyleSheet("color:#cfcfcf;")
+
+        # legend
+        try:
+            from printing_detection import class_color
+            def _sw(name: str) -> str:
+                b, g, r = class_color(name)
+                return f"#{r:02x}{g:02x}{b:02x}"
+            nozzle_c = _sw("nozzle")
+            new_c = _sw("new_deposit")
+            old_c = _sw("old_deposit")
+        except Exception:
+            nozzle_c, new_c, old_c = "#55ddee", "#dd55ee", "#dddd55"
+
+        self.legend_lbl = QtWidgets.QLabel(
+            f"<span style=\"display:inline-block;width:12px;height:12px;background:{nozzle_c};\"></span> nozzle &nbsp;&nbsp;"
+            f"<span style=\"display:inline-block;width:12px;height:12px;background:{new_c};\"></span> new_deposit &nbsp;&nbsp;"
+            f"<span style=\"display:inline-block;width:12px;height:12px;background:{old_c};\"></span> old_deposit"
+        )
+        self.legend_lbl.setTextFormat(QtCore.Qt.RichText)
+        self.legend_lbl.setStyleSheet("color:#dcdcdc;")
+
+        status_box = QtWidgets.QGroupBox("Status")
+        status_l = QtWidgets.QVBoxLayout(status_box)
+        status_l.addWidget(self.print_pill)
+        status_l.addWidget(self.det_reason)
+        status_l.addWidget(self.det_conf_lbl)
+        status_l.addWidget(self.det_timer_lbl)
+        status_l.addWidget(self.legend_lbl)
+        status_l.setContentsMargins(10, 12, 10, 10)
+        status_l.setSpacing(6)
+
+        layout.addWidget(status_box, 0, 0, 1, 2)
 
         def _view_box(title: str, subtitle: str, inner: QtWidgets.QWidget) -> QtWidgets.QGroupBox:
             box = QtWidgets.QGroupBox(title)
@@ -522,9 +673,9 @@ class MainWindow(QtWidgets.QWidget):
             v.setSpacing(6)
             return box
 
-        self.box_det = _view_box("1  Segmentation (decision)", "Masks (60% opacity) + ROI + tip-zone. This is the view that decides PRINTING vs NOT PRINTING.", self.det_label)
+        self.box_det = _view_box("1  Segmentation (decision)", "Masks (60% opacity) + ROI + tip-zone.", self.det_label)
         self.box_rgb = _view_box("2  RGB (raw)", "Clean RGB feed without overlays.", self.rgb_full_label)
-        self.box_depth = _view_box("3  RGBD (depth preview)", "Aligned depth preview for debugging (not used for the decision).", self.depth_label)
+        self.box_depth = _view_box("3  RGBD (depth preview)", "Aligned depth preview for debugging.", self.depth_label)
         self.box_crop = _view_box("4  Crop RGB (ROI)", "ROI crop used as input for detection.", self.rgb_crop_label)
 
         cam_grid = QtWidgets.QGridLayout()
@@ -538,8 +689,85 @@ class MainWindow(QtWidgets.QWidget):
         cam_grid.setRowStretch(1, 1)
         cam_grid.setRowStretch(2, 1)
 
-        layout.addLayout(cam_grid, 0, 0, 1, 2)
+        layout.addLayout(cam_grid, 1, 0, 1, 2)
+        layout.setRowStretch(0, 0)
+        layout.setRowStretch(1, 1)
 
+    @QtCore.pyqtSlot(dict)
+    def on_frame(self, payload: dict):
+        rgb_full = payload.get("rgb_full", None)
+        depth_prev = payload.get("depth_preview", None)
+        rgb_crop_bgr = payload.get("rgb_crop_bgr", None)
+        det_vis_bgr = payload.get("det_vis_bgr", None)
+        det_state = payload.get("det_state", None)
+
+        # operator friendly pill
+        if det_state is not None:
+            printing = bool(det_state.get("printing", False))
+            nozzle_conf = float(det_state.get("nozzle_conf", 0.0))
+            new_area = float(det_state.get("new_area_roi_pct", 0.0))
+            overlap_tip = float(det_state.get("overlap_tip", 0.0))
+            on_count = int(det_state.get("on_count", 0))
+            off_count = int(det_state.get("off_count", 0))
+
+            now = time.time()
+            if printing:
+                self._no_print_since = None
+            else:
+                if self._no_print_since is None:
+                    self._no_print_since = now
+
+            if printing:
+                self.print_pill.setText("PRINTING")
+                self.print_pill.setStyleSheet("padding:10px; border-radius:12px; background:#123a24; color:#eaeaea; font-size:18px; font-weight:700;")
+            else:
+                self.print_pill.setText("NOT PRINTING")
+                self.print_pill.setStyleSheet("padding:10px; border-radius:12px; background:#3a1414; color:#eaeaea; font-size:18px; font-weight:700;")
+
+            self.det_reason.setText(
+                f"Reason: overlap_tip={overlap_tip:.3f}, new_area_roi={new_area*100:.2f}%, on={on_count}, off={off_count}"
+            )
+            self.det_conf_lbl.setText(f"Confidence: nozzle_conf={nozzle_conf:.2f}")
+
+            if self._no_print_since is None:
+                self.det_timer_lbl.setText("No-print timer: 0.0 s")
+            else:
+                self.det_timer_lbl.setText(f"No-print timer: {now - self._no_print_since:.1f} s")
+
+        if rgb_full is not None:
+            self._show_bgr_on_label(cv2.cvtColor(rgb_full, cv2.COLOR_RGB2BGR), self.rgb_full_label)
+        if depth_prev is not None:
+            self._show_bgr_on_label(depth_prev, self.depth_label)
+        if rgb_crop_bgr is not None:
+            self._show_bgr_on_label(rgb_crop_bgr, self.rgb_crop_label)
+        if det_vis_bgr is not None:
+            self._show_bgr_on_label(det_vis_bgr, self.det_label)
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        try:
+            self.sig_close.emit()
+        except Exception:
+            pass
+        event.accept()
+
+
+
+class SetupWindow(QtWidgets.QWidget):
+    """Window 2: setup only (controls + plot)."""
+
+    sig_close = QtCore.pyqtSignal()
+
+    def __init__(self, worker: CaptureWorker):
+        super().__init__()
+        self.worker = worker
+        self.setWindowTitle("Setup")
+        self.resize(980, 980)
+
+        self._t0 = time.time()
+        self._x: Deque[float] = deque(maxlen=600)
+        self._y_axes: Deque[np.ndarray] = deque(maxlen=600)
+        self._y_pwm: Deque[float] = deque(maxlen=600)
+
+        layout = QtWidgets.QVBoxLayout(self)
 
         # plot
         self.plot = pg.PlotWidget()
@@ -547,14 +775,13 @@ class MainWindow(QtWidgets.QWidget):
         self.plot.setBackground((14, 14, 14))
         self.plot.getPlotItem().setMouseEnabled(x=False, y=False)
         self.plot.setMenuEnabled(False)
+        self.plot.addLegend(offset=(15, 15))
 
-        self.legend = self.plot.addLegend(offset=(15, 15))
         self.curves = []
         curve_names = ["Axis 01", "Axis 02", "Axis 03", "Axis 04", "Axis 05", "Axis 06"]
         for i in range(6):
             pen = pg.mkPen(pg.intColor(i, hues=6), width=2)
-            c = self.plot.plot([], [], pen=pen, name=curve_names[i])
-            self.curves.append(c)
+            self.curves.append(self.plot.plot([], [], pen=pen, name=curve_names[i]))
         self.pwm_curve = self.plot.plot([], [], pen=pg.mkPen((240, 240, 240), width=2), name="E1_ON (PWM)")
 
         # controls
@@ -591,19 +818,16 @@ class MainWindow(QtWidgets.QWidget):
         self.det_every.setValue(1)
         self.det_every.valueChanged.connect(self.on_detection_changed)
 
-        # detection tuning
         self.det_conf = QtWidgets.QDoubleSpinBox()
         self.det_conf.setRange(0.01, 0.99)
         self.det_conf.setSingleStep(0.01)
         self.det_conf.setValue(0.35)
-        self.det_conf.setToolTip("Minimum confidence for detections. Higher = fewer false positives, but may miss weak masks.")
         self.det_conf.valueChanged.connect(self.on_detection_changed)
 
         self.det_alpha = QtWidgets.QDoubleSpinBox()
         self.det_alpha.setRange(0.0, 1.0)
         self.det_alpha.setSingleStep(0.05)
         self.det_alpha.setValue(0.60)
-        self.det_alpha.setToolTip("Mask overlay opacity in view 1 (segmentation). 0 = invisible, 1 = solid.")
         self.det_alpha.valueChanged.connect(self.on_detection_changed)
 
         self.depth_min = QtWidgets.QSpinBox()
@@ -642,37 +866,6 @@ class MainWindow(QtWidgets.QWidget):
         self.btn_record.setCheckable(True)
         self.btn_record.clicked.connect(self.toggle_record)
 
-
-        # status (operator friendly)
-        self.print_pill = QtWidgets.QLabel("PRINTING: -")
-        self.print_pill.setAlignment(QtCore.Qt.AlignCenter)
-        self.print_pill.setStyleSheet("padding:10px; border-radius:12px; background:#1a1a1a; color:#eaeaea; font-size:18px; font-weight:600;")
-
-        self.det_reason = QtWidgets.QLabel("Reason: -")
-        self.det_reason.setStyleSheet("color:#cfcfcf;")
-        self.det_reason.setWordWrap(True)
-
-        self.det_conf_lbl = QtWidgets.QLabel("Confidence: -")
-        self.det_conf_lbl.setStyleSheet("color:#cfcfcf;")
-
-        self.det_timer_lbl = QtWidgets.QLabel("No-print timer: -")
-        self.det_timer_lbl.setStyleSheet("color:#cfcfcf;")
-
-        # legend (colors are deterministic by class name in printing_detection.py)
-        try:
-            from printing_detection import class_color
-            def _sw(name: str) -> str:
-                b, g, r = class_color(name)
-                return f"#{r:02x}{g:02x}{b:02x}"
-            nozzle_c = _sw("nozzle")
-            new_c = _sw("new_deposit")
-            old_c = _sw("old_deposit")
-        except Exception:
-            nozzle_c, new_c, old_c = "#55ddee", "#dd55ee", "#dddd55"
-
-        self.legend_lbl = QtWidgets.QLabel(            f"<span style=\"display:inline-block;width:12px;height:12px;background:{nozzle_c};\"></span> nozzle &nbsp;&nbsp;"            f"<span style=\"display:inline-block;width:12px;height:12px;background:{new_c};\"></span> new_deposit &nbsp;&nbsp;"            f"<span style=\"display:inline-block;width:12px;height:12px;background:{old_c};\"></span> old_deposit"        )
-        self.legend_lbl.setTextFormat(QtCore.Qt.RichText)
-        self.legend_lbl.setStyleSheet("color:#dcdcdc;")
         small = QtGui.QFont("Segoe UI", 8)
         self.lbl_ts = QtWidgets.QLabel("t_wall: - | rs_depth_ms: - | det: -")
         self.lbl_ts.setFont(small)
@@ -685,11 +878,6 @@ class MainWindow(QtWidgets.QWidget):
         form.addRow("Next session folder:", self.next_name)
         form.addRow("Duration:", self.duration)
         form.addRow("Rotate (deg):", self.rotate_combo)
-        form.addRow(self.print_pill)
-        form.addRow(self.det_reason)
-        form.addRow(self.det_conf_lbl)
-        form.addRow(self.det_timer_lbl)
-        form.addRow(self.legend_lbl)
 
         form.addRow(self.det_enable)
         form.addRow("Model:", self.det_model)
@@ -707,12 +895,8 @@ class MainWindow(QtWidgets.QWidget):
         form.addRow(self.lbl_robot)
         form.addRow(self.lbl_status)
 
-        layout.addWidget(self.plot, 1, 0, 1, 2)
-        layout.addWidget(ctrl, 2, 0, 1, 2)
-        layout.setRowStretch(0, 5)
-        layout.setRowStretch(1, 2)
-        layout.setRowStretch(2, 0)
-
+        layout.addWidget(self.plot, 1)
+        layout.addWidget(ctrl, 0)
 
         self._detector_ui: Optional[PrintingDetector] = None
 
@@ -720,13 +904,19 @@ class MainWindow(QtWidgets.QWidget):
         self.on_depth_range_changed()
         self.on_crop_changed()
 
-        # Now it's safe to show torch status
         if TORCH_OK:
             self.on_status("Torch/Ultralytics preload OK (imported before Qt/OpenCV)")
         else:
             self.on_status(f"Torch preload FAILED: {TORCH_ERR}")
 
         self.on_detection_changed()
+
+    def closeEvent(self, event: QtGui.QCloseEvent):
+        try:
+            self.sig_close.emit()
+        except Exception:
+            pass
+        event.accept()
 
     def update_next_name(self):
         base = Path(self.out_base.text()).expanduser()
@@ -790,68 +980,11 @@ class MainWindow(QtWidgets.QWidget):
             self.btn_record.setText("● Record")
             self.update_next_name()
 
-    def _show_bgr_on_label(self, bgr: np.ndarray, label: QtWidgets.QLabel):
-        if bgr is None:
-            return
-        h, w = bgr.shape[:2]
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        qimg = QtGui.QImage(rgb.data, w, h, 3 * w, QtGui.QImage.Format_RGB888)
-        pix = QtGui.QPixmap.fromImage(qimg)
-        label.setPixmap(pix.scaled(label.width(), label.height(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
-
     @QtCore.pyqtSlot(dict)
-    def on_frame(self, payload: dict):
-        rgb_full = payload.get("rgb_full", None)
-        depth_prev = payload.get("depth_preview", None)
-        rgb_crop_bgr = payload.get("rgb_crop_bgr", None)
-        det_vis_bgr = payload.get("det_vis_bgr", None)
-        det_state = payload.get("det_state", None)
-        # update operator-friendly status blocks (PRINTING / NOT PRINTING)
-        if det_state is not None:
-            printing = bool(det_state.get("printing", False))
-            nozzle_conf = float(det_state.get("nozzle_conf", 0.0))
-            new_area = float(det_state.get("new_area_roi_pct", 0.0))
-            overlap_tip = float(det_state.get("overlap_tip", 0.0))
-            on_count = int(det_state.get("on_count", 0))
-            off_count = int(det_state.get("off_count", 0))
-
-            # state timer
-            now = time.time()
-            if printing:
-                self._no_print_since = None
-            else:
-                if self._no_print_since is None:
-                    self._no_print_since = now
-
-            # pill styling
-            if printing:
-                self.print_pill.setText("PRINTING")
-                self.print_pill.setStyleSheet("padding:10px; border-radius:12px; background:#123a24; color:#eaeaea; font-size:18px; font-weight:700;")
-            else:
-                self.print_pill.setText("NOT PRINTING")
-                self.print_pill.setStyleSheet("padding:10px; border-radius:12px; background:#3a1414; color:#eaeaea; font-size:18px; font-weight:700;")
-
-            reason = f"Reason: overlap_tip={overlap_tip:.3f}, new_area_roi={new_area*100:.2f}%, on={on_count}, off={off_count}"
-            self.det_reason.setText(reason)
-            self.det_conf_lbl.setText(f"Confidence: nozzle_conf={nozzle_conf:.2f}")
-
-            if self._no_print_since is None:
-                self.det_timer_lbl.setText("No-print timer: 0.0 s")
-            else:
-                self.det_timer_lbl.setText(f"No-print timer: {now - self._no_print_since:.1f} s")
-
-
-        if rgb_full is not None:
-            self._show_bgr_on_label(cv2.cvtColor(rgb_full, cv2.COLOR_RGB2BGR), self.rgb_full_label)
-        if depth_prev is not None:
-            self._show_bgr_on_label(depth_prev, self.depth_label)
-        if rgb_crop_bgr is not None:
-            self._show_bgr_on_label(rgb_crop_bgr, self.rgb_crop_label)
-        if det_vis_bgr is not None:
-            self._show_bgr_on_label(det_vis_bgr, self.det_label)
-
+    def on_frame_meta(self, payload: dict):
         t_wall = payload.get("t_wall", None)
         t_rs = payload.get("t_rs_depth", None)
+        det_state = payload.get("det_state", None)
 
         det_txt = "-"
         if det_state is not None:
@@ -892,10 +1025,45 @@ class MainWindow(QtWidgets.QWidget):
         self.lbl_status.setText(f"Status: {msg}")
 
 
+class AppController(QtCore.QObject):
+    def __init__(self):
+        super().__init__()
+        self.worker = CaptureWorker()
+        self.visual = VisualWindow()
+        self.setup = SetupWindow(self.worker)
+
+        # forward worker signals
+        self.worker.sig_frame.connect(self.visual.on_frame)
+        self.worker.sig_frame.connect(self.setup.on_frame_meta)
+        self.worker.sig_robot.connect(self.setup.on_robot)
+        self.worker.sig_status.connect(self.setup.on_status)
+
+        # close handling
+        self.setup.sig_close.connect(self.shutdown)
+        self.visual.sig_close.connect(self.shutdown)
+
+        self.worker.start()
+
+    @QtCore.pyqtSlot()
+    def shutdown(self):
+        if self.worker is not None:
+            try:
+                self.worker.stop()
+                self.worker.wait(2000)
+            except Exception:
+                pass
+            self.worker = None
+        try:
+            QtWidgets.QApplication.quit()
+        except Exception:
+            pass
+
+
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    w = MainWindow()
-    w.show()
+    c = AppController()
+    c.visual.show()
+    c.setup.show()
     sys.exit(app.exec_())
 
 

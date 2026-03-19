@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Any
+from typing import Dict, Optional, Tuple, Any, Union
 
 import cv2
 import numpy as np
@@ -83,6 +83,19 @@ def get_best_box_of_class(boxes, names: Dict[int, str], class_name: str):
         if best is None or cand[0] > best[0]:
             best = cand
     return best
+
+
+def clamp_box_to_frame(box_xyxy: Tuple[int, int, int, int], W: int, H: int) -> Tuple[int, int, int, int]:
+    x1, y1, x2, y2 = [int(v) for v in box_xyxy]
+    x1 = clamp(x1, 0, W - 1)
+    y1 = clamp(y1, 0, H - 1)
+    x2 = clamp(x2, 0, W - 1)
+    y2 = clamp(y2, 0, H - 1)
+    if x2 <= x1:
+        x2 = min(W - 1, x1 + 1)
+    if y2 <= y1:
+        y2 = min(H - 1, y1 + 1)
+    return int(x1), int(y1), int(x2), int(y2)
 
 
 def build_class_masks(res, names: Dict[int, str], H: int, W: int) -> Dict[str, np.ndarray]:
@@ -179,14 +192,39 @@ class PrintingDetector:
         self.on_count = 0
         self.off_count = 0
 
-        # nozzle hold
+        # nozzle hold for crop/internal logic
         self.last_nozzle_time = 0.0
         self.last_nozzle = None
+
+        # nozzle hold for full-frame pre-detection
+        self.pref_last_nozzle_time = 0.0
+        self.pref_last_nozzle = None
 
         self._last_vis = None
         self._last_state = PrintingState(False, 0.0, 0.0, 0.0, 0, 0)
 
-    def update(self, frame_bgr: np.ndarray):
+    def detect_best_nozzle(self, frame_bgr: np.ndarray):
+        if frame_bgr is None:
+            return None
+        H, W = frame_bgr.shape[:2]
+        if H < 2 or W < 2:
+            return None
+
+        res = self.model.predict(frame_bgr, conf=self.conf, verbose=False)[0]
+        nozzle = get_best_box_of_class(res.boxes, self.names, self.CLASS_NOZZLE)
+
+        now = time.time()
+        if nozzle is not None:
+            self.pref_last_nozzle = nozzle
+            self.pref_last_nozzle_time = now
+            return nozzle
+
+        if self.pref_last_nozzle is not None and (now - self.pref_last_nozzle_time) <= self.NOZZLE_HOLD_SEC:
+            return self.pref_last_nozzle
+
+        return None
+
+    def update(self, frame_bgr: np.ndarray, external_nozzle: Optional[Union[Tuple[float, int, int, Tuple[int, int, int, int]], Dict[str, Any]]] = None):
         t0 = time.time()
 
         if frame_bgr is None:
@@ -210,8 +248,33 @@ class PrintingDetector:
             self.last_nozzle_time = now
 
         use_nozzle = None
-        if self.last_nozzle is not None and (now - self.last_nozzle_time) <= self.NOZZLE_HOLD_SEC:
+        nozzle_source = "internal"
+        if external_nozzle is not None:
+            try:
+                if isinstance(external_nozzle, dict):
+                    conf = float(external_nozzle.get("conf", 0.0))
+                    nx = int(external_nozzle.get("cx", external_nozzle.get("x", -1)))
+                    ny = int(external_nozzle.get("cy", external_nozzle.get("y", -1)))
+                    nbbox = tuple(int(v) for v in external_nozzle.get("box", (nx - 1, ny - 1, nx + 1, ny + 1)))
+                else:
+                    conf, nx, ny, nbbox = external_nozzle
+                    conf = float(conf)
+                    nx = int(nx)
+                    ny = int(ny)
+                    nbbox = tuple(int(v) for v in nbbox)
+
+                if 0 <= nx < W and 0 <= ny < H:
+                    nbbox = clamp_box_to_frame(nbbox, W, H)
+                    use_nozzle = (conf, nx, ny, nbbox)
+                    self.last_nozzle = use_nozzle
+                    self.last_nozzle_time = now
+                    nozzle_source = "external"
+            except Exception:
+                use_nozzle = None
+
+        if use_nozzle is None and self.last_nozzle is not None and (now - self.last_nozzle_time) <= self.NOZZLE_HOLD_SEC:
             use_nozzle = self.last_nozzle
+            nozzle_source = "held"
 
         nozzle_conf = 0.0
         nx = ny = -1
@@ -282,7 +345,7 @@ class PrintingDetector:
             off_count=int(self.off_count),
         )
 
-        dbg = {"python": f"dt={(time.time()-t0)*1000.0:.1f}ms"}
+        dbg = {"python": f"dt={(time.time()-t0)*1000.0:.1f}ms", "nozzle_source": nozzle_source}
 
         self._last_vis = vis
         self._last_state = state
