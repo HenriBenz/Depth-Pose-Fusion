@@ -67,6 +67,25 @@ def parse_pwm(raw: str) -> Optional[float]:
     return safe_float(raw)
 
 
+
+def _to_text(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", errors="ignore").replace("\x00", "").strip()
+    return str(v).strip()
+
+
+def _parse_num_from_struct(s: str, key: str) -> Optional[float]:
+    """Parse 'A1 12.3' style tokens from KUKA $AXIS_ACT / structs."""
+    try:
+        m = re.search(rf"\b{re.escape(key)}\s+(-?\d+(?:\.\d+)?)", str(s))
+        if not m:
+            return None
+        return float(m.group(1))
+    except Exception:
+        return None
+
 def frame_id_str(i: int) -> str:
     return f"{i:06d}"
 
@@ -175,22 +194,104 @@ class RobotSample:
 
 
 class RobotClient:
-    def __init__(self, ip: str, port: int = 7000):
+    """KUKA reader (OpenShowVar). Tries to read E1_ON if available.
+    If E1_ON is not available, derives a binary ON/OFF signal from E1 velocity
+    (same logic style as ui_recorder.py).
+    """
+
+    def __init__(self, ip: str, port: int = 7000, e1_vel_threshold: float = 5.0):
         self.ip = ip
         self.port = port
+        self.e1_vel_threshold = float(e1_vel_threshold)
+
         self._osv = openshowvar(self.ip, self.port)
+
+        self._last_e1: Optional[float] = None
+        self._last_t: Optional[float] = None
+
+    def _e1_on_from_velocity(self, t: float, e1: Optional[float]) -> Optional[float]:
+        if e1 is None:
+            return None
+        if self._last_e1 is None or self._last_t is None:
+            self._last_e1 = float(e1)
+            self._last_t = float(t)
+            return None
+        dt = float(t) - float(self._last_t)
+        if dt <= 1e-6:
+            return None
+        vel = abs((float(e1) - float(self._last_e1)) / dt)
+        self._last_e1 = float(e1)
+        self._last_t = float(t)
+        return 1.0 if vel >= self.e1_vel_threshold else 0.0
 
     def poll(self) -> Optional[RobotSample]:
         t = time.time()
-        raw_axis = self._osv.read("$AXIS_ACT")
-        raw_pwm = self._osv.read("E1_ON")
-        axis = parse_axis_act(raw_axis)
-        pwm = parse_pwm(raw_pwm)
+
+        try:
+            raw_axis = _to_text(self._osv.read("$AXIS_ACT"))
+        except Exception:
+            raw_axis = ""
+        if not raw_axis:
+            return None
+
+        # axis A1..A6 + E1 if present
+        a1 = _parse_num_from_struct(raw_axis, "A1")
+        a2 = _parse_num_from_struct(raw_axis, "A2")
+        a3 = _parse_num_from_struct(raw_axis, "A3")
+        a4 = _parse_num_from_struct(raw_axis, "A4")
+        a5 = _parse_num_from_struct(raw_axis, "A5")
+        a6 = _parse_num_from_struct(raw_axis, "A6")
+        e1 = _parse_num_from_struct(raw_axis, "E1")
+
+        axis = None
+        if all(v is not None for v in (a1, a2, a3, a4, a5, a6)):
+            axis = np.array([a1, a2, a3, a4, a5, a6], dtype=np.float32)
+        else:
+            # fallback: old parser (first 6 numeric tokens)
+            axis = parse_axis_act(raw_axis)
+
+        # Prefer direct E1_ON variable if it exists
+        raw_e1_on = ""
+        pwm = None
+        try:
+            raw_e1_on = _to_text(self._osv.read("E1_ON"))
+            pwm = parse_pwm(raw_e1_on)
+        except Exception:
+            raw_e1_on = ""
+            pwm = None
+
+        # If not available, derive from E1 velocity
+        if pwm is None:
+            pwm = self._e1_on_from_velocity(t, e1)
+
+        # Optional extra vars for debugging/logging (no hard dependency)
+        raw_e_rpm = ""
+        raw_extr_mod = ""
+        raw_ov = ""
+        try:
+            raw_e_rpm = _to_text(self._osv.read("E_RPM"))
+        except Exception:
+            pass
+        try:
+            raw_extr_mod = _to_text(self._osv.read("EXTR_MOD"))
+        except Exception:
+            pass
+        try:
+            raw_ov = _to_text(self._osv.read("$OV_PRO"))
+        except Exception:
+            pass
+
         return RobotSample(
             t_wall=t,
             axis=axis,
             pwm=pwm,
-            raw={"$AXIS_ACT": raw_axis, "E1_ON": raw_pwm},
+            raw={
+                "$AXIS_ACT": raw_axis,
+                "E1_ON": raw_e1_on,
+                "E_RPM": raw_e_rpm,
+                "EXTR_MOD": raw_extr_mod,
+                "$OV_PRO": raw_ov,
+            },
         )
 
 
@@ -206,7 +307,7 @@ class CaptureWorker(QtCore.QThread):
         fps: int = 30,
         no_rgb: bool = False,
         rotate_deg: int = 180,
-        robot_ip: str = "172.31.1.147",
+        robot_ip: str = "10.1.0.121",
         port: int = 7000,
     ):
         super().__init__()
